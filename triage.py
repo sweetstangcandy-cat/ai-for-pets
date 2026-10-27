@@ -1,11 +1,13 @@
 ﻿"""照護提醒分級規則（純 Python，不含 UI，方便測試）。
 
 定位：資訊整理與照護提醒工具，不做疾病診斷，不取代獸醫師判斷。
+體重與年齡僅用於照護提醒與摘要，本版不做任何劑量計算。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+SPECIES_OPTIONS = ["貓", "狗"]
 APPETITE_OPTIONS = ["正常", "減少", "完全不吃"]
 WATER_OPTIONS = ["正常", "增加", "減少"]
 STOOL_OPTIONS = ["正常", "軟便或腹瀉", "便秘或未排便", "血便或黑便"]
@@ -26,6 +28,11 @@ GREEN = "green"
 # 出現即列為紅燈（建議盡快聯繫獸醫）的症狀
 RED_SYMPTOMS = {"呼吸急促或困難", "抽搐或意識不清", "無法排尿"}
 
+WEIGHT_RANGE_KG = (0.5, 100.0)
+AGE_RANGE_YEARS = (0.0, 40.0)
+# 與上次紀錄相比，體重變化達此比例以上即提醒飼主告知獸醫
+WEIGHT_CHANGE_THRESHOLD = 0.05
+
 
 @dataclass
 class CheckIn:
@@ -35,6 +42,10 @@ class CheckIn:
     energy: str = "活潑"
     symptoms: list[str] = field(default_factory=list)
     missed_doses: int = 0
+    species: str = "貓"
+    age_years: float | None = None
+    weight_kg: float | None = None
+    previous_weight_kg: float | None = None
 
 
 @dataclass
@@ -43,6 +54,30 @@ class TriageResult:
     title: str
     reasons: list[str]
     action: str
+
+
+def validate_profile(weight_kg: float | None, age_years: float | None) -> list[str]:
+    """檢查體重與年齡是否在合理範圍內，回傳錯誤訊息清單。"""
+    errors: list[str] = []
+    if weight_kg is not None and not (WEIGHT_RANGE_KG[0] <= weight_kg <= WEIGHT_RANGE_KG[1]):
+        errors.append(f"體重需介於 {WEIGHT_RANGE_KG[0]} 到 {WEIGHT_RANGE_KG[1]} 公斤之間")
+    if age_years is not None and not (AGE_RANGE_YEARS[0] <= age_years <= AGE_RANGE_YEARS[1]):
+        errors.append(f"年齡需介於 {AGE_RANGE_YEARS[0]} 到 {AGE_RANGE_YEARS[1]} 歲之間")
+    return errors
+
+
+def weight_change_note(current: float | None, previous: float | None) -> str | None:
+    """若體重與上次紀錄相比變化達門檻，回傳提醒文字；否則回傳 None。"""
+    if not current or not previous:
+        return None
+    change = (current - previous) / previous
+    if abs(change) < WEIGHT_CHANGE_THRESHOLD:
+        return None
+    direction = "上升" if change > 0 else "下降"
+    return (
+        f"體重較上次紀錄{direction}約 {abs(change) * 100:.1f}%"
+        f"（{previous:.1f} → {current:.1f} 公斤），建議告知獸醫"
+    )
 
 
 def triage_checkin(c: CheckIn) -> TriageResult:
@@ -72,6 +107,9 @@ def triage_checkin(c: CheckIn) -> TriageResult:
             yellow.append(f"出現「{s}」")
     if c.missed_doses > 0:
         yellow.append(f"今日漏服用藥 {c.missed_doses} 次")
+    note = weight_change_note(c.weight_kg, c.previous_weight_kg)
+    if note:
+        yellow.append(note)
 
     if red:
         return TriageResult(
@@ -97,8 +135,11 @@ def triage_checkin(c: CheckIn) -> TriageResult:
 
 def build_soap_draft(c: CheckIn, result: TriageResult, vet_exam: str) -> dict[str, str]:
     """產生 SOAP 草稿。A 欄一律標註為規則式參考，不是診斷。"""
+    age_text = f"{c.age_years:g} 歲" if c.age_years is not None else "年齡未填"
+    weight_text = f"{c.weight_kg:g} 公斤" if c.weight_kg else "體重未填"
     symptom_text = "、".join(c.symptoms) if c.symptoms else "無其他症狀"
     s = (
+        f"基本資料：{c.species}，{age_text}，{weight_text}。"
         f"居家觀察（飼主填寫）：食慾{c.appetite}，飲水{c.water}，排便{c.stool}，"
         f"精神{c.energy}；其他症狀：{symptom_text}。"
     )
@@ -132,4 +173,6 @@ def owner_care_plan(c: CheckIn, result: TriageResult) -> list[str]:
         steps.append("飲水明顯增加時，請記錄大約的飲水量與持續天數，就診時提供給獸醫。")
     if c.missed_doses:
         steps.append("有漏服用藥時，請勿自行補服或加倍，請先聯繫診所確認。")
+    if c.weight_kg:
+        steps.append("體重請固定在相近時段測量（例如每週同一天），方便就診時比較趨勢。")
     return steps

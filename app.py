@@ -17,6 +17,7 @@ from triage import (
     ENERGY_OPTIONS,
     GREEN,
     RED,
+    SPECIES_OPTIONS,
     STOOL_OPTIONS,
     SYMPTOM_OPTIONS,
     WATER_OPTIONS,
@@ -25,21 +26,17 @@ from triage import (
     build_soap_draft,
     owner_care_plan,
     triage_checkin,
+    validate_profile,
 )
 
 PLACEHOLDER = "請選擇"
-REQUIRED_KEYS = ["appetite", "water", "stool", "energy"]
+CORE_KEYS = ["appetite", "water", "stool", "energy"]
 DRAFT_PLACEHOLDER = "（待獸醫填寫）"
 DISCLAIMER = (
     "本作品提供之資訊僅供輔助參考，不能取代獸醫師之診斷、治療或專業建議。"
     "貓犬之健康與營養需求可能因個體狀況而異，如有健康疑慮或需要調整飲食與照護方式，請諮詢合格獸醫師。"
 )
-DEMO_PATIENT = {
-    "id": "DEMO-001",
-    "name": "小橘（虛構示範）",
-    "species": "貓",
-    "age": "3 歲（虛構）",
-}
+DEMO_PATIENT = {"id": "DEMO-001", "name": "小橘（虛構示範）"}
 LEVEL_LABEL = {RED: "🔴 紅燈", YELLOW: "🟡 黃燈", GREEN: "🟢 綠燈"}
 
 st.set_page_config(page_title="毛孩照護閉環 Prototype", page_icon="🐾", layout="wide")
@@ -80,12 +77,51 @@ def publish_plan() -> None:
         st.session_state.published_plan = {"text": text, "date": date.today().isoformat()}
 
 
+def latest_weight() -> float | None:
+    """取得最近一次的體重：優先打卡紀錄，其次為診前紀錄。"""
+    for entry in st.session_state.checkins:
+        if entry["checkin"].weight_kg:
+            return entry["checkin"].weight_kg
+    visit = st.session_state.visit_data
+    if visit is not None and visit.weight_kg:
+        return visit.weight_kg
+    return None
+
+
 # ---------- 共用元件 ----------
 def pre_completion_rate() -> int:
+    total = len(CORE_KEYS) + 2  # 四項居家觀察 + 年齡 + 體重
     filled = sum(
-        st.session_state.get(f"pre_{k}", PLACEHOLDER) != PLACEHOLDER for k in REQUIRED_KEYS
+        st.session_state.get(f"pre_{k}", PLACEHOLDER) != PLACEHOLDER for k in CORE_KEYS
     )
-    return round(filled / len(REQUIRED_KEYS) * 100)
+    filled += int(bool(st.session_state.get("pre_age", 0.0)))
+    filled += int(bool(st.session_state.get("pre_weight", 0.0)))
+    return round(filled / total * 100)
+
+
+def collect_profile() -> dict:
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        species = st.selectbox("物種＊", SPECIES_OPTIONS, key="pre_species")
+    with col2:
+        age = st.number_input(
+            "年齡（歲）＊", min_value=0.0, max_value=40.0, value=0.0, step=0.5, key="pre_age"
+        )
+    with col3:
+        weight = st.number_input(
+            "體重（公斤）＊",
+            min_value=0.0,
+            max_value=100.0,
+            value=0.0,
+            step=0.1,
+            format="%.1f",
+            key="pre_weight",
+        )
+    return {
+        "species": species,
+        "age": float(age) or None,
+        "weight": float(weight) or None,
+    }
 
 
 def collect_core(prefix: str) -> dict:
@@ -106,18 +142,30 @@ def collect_core(prefix: str) -> dict:
     }
 
 
-def is_complete(values: dict) -> bool:
-    return all(values[k] != PLACEHOLDER for k in REQUIRED_KEYS)
+def is_complete(core: dict) -> bool:
+    return all(core[k] != PLACEHOLDER for k in CORE_KEYS)
 
 
-def to_checkin(values: dict, missed: int = 0) -> CheckIn:
+def to_checkin(
+    core: dict,
+    *,
+    missed: int = 0,
+    weight: float | None = None,
+    previous_weight: float | None = None,
+    species: str = "貓",
+    age: float | None = None,
+) -> CheckIn:
     return CheckIn(
-        appetite=values["appetite"],
-        water=values["water"],
-        stool=values["stool"],
-        energy=values["energy"],
-        symptoms=list(values["symptoms"]),
+        appetite=core["appetite"],
+        water=core["water"],
+        stool=core["stool"],
+        energy=core["energy"],
+        symptoms=list(core["symptoms"]),
         missed_doses=missed,
+        species=species,
+        age_years=age,
+        weight_kg=weight,
+        previous_weight_kg=previous_weight,
     )
 
 
@@ -144,7 +192,7 @@ role = st.sidebar.radio("檢視身份（僅供 Demo 展示）", ["飼主", "獸�
 st.sidebar.markdown(
     f"**病患編號**：{DEMO_PATIENT['id']}\n\n"
     f"**寵物**：{DEMO_PATIENT['name']}\n\n"
-    f"**物種 / 年齡**：{DEMO_PATIENT['species']} / {DEMO_PATIENT['age']}"
+    "基本資料由診前表單填寫。"
 )
 today = date.today().isoformat()
 st.sidebar.metric("診前必填完成率", f"{pre_completion_rate()}%")
@@ -167,40 +215,79 @@ if role == "飼主":
     with tab_pre:
         st.subheader("診前居家觀察")
         st.caption("就診前填寫，系統會整理成重點摘要給獸醫參考。＊為必填欄位。")
-        values = collect_core("pre")
+        st.markdown("#### 寵物基本資料")
+        profile = collect_profile()
+        st.markdown("#### 居家觀察")
+        core = collect_core("pre")
         if st.button("儲存診前紀錄", type="primary", key="pre_save"):
-            if is_complete(values):
-                st.session_state.visit_data = to_checkin(values)
-                st.success("已儲存，獸醫可於「診前摘要」查看。")
+            errors = validate_profile(profile["weight"], profile["age"])
+            if not (profile["age"] and profile["weight"]):
+                st.warning("請先填寫年齡與體重。")
+            elif not is_complete(core):
+                st.warning("請先完成四項居家觀察的必填欄位（＊）。")
+            elif errors:
+                for err in errors:
+                    st.error(err)
             else:
-                st.warning("請先完成四項必填欄位（＊）。")
+                st.session_state.visit_data = to_checkin(
+                    core,
+                    weight=profile["weight"],
+                    species=profile["species"],
+                    age=profile["age"],
+                )
+                st.success("已儲存，獸醫可於「診前摘要」查看。")
         if st.session_state.visit_data is not None:
             st.markdown("#### 系統初步提醒")
             show_result(triage_checkin(st.session_state.visit_data))
 
     with tab_checkin:
         st.subheader("每日照護打卡")
-        st.caption("僅記錄飼主的人工觀察，本版不使用影像、聲音或定位資料。")
-        values = collect_core("ci")
+        st.caption("記錄飼主的人工觀察與體重（選填），本版不使用影像、聲音或定位資料。")
+        core = collect_core("ci")
+        weight_now = st.number_input(
+            "今日體重（公斤，選填，0 表示未量測）",
+            min_value=0.0,
+            max_value=100.0,
+            value=0.0,
+            step=0.1,
+            format="%.1f",
+            key="ci_weight",
+        )
         missed = st.number_input(
             "今日漏服用藥次數", min_value=0, max_value=10, value=0, key="ci_missed"
         )
         if st.button("送出今日打卡", type="primary", key="ci_submit"):
-            if is_complete(values):
-                checkin = to_checkin(values, int(missed))
-                result = triage_checkin(checkin)
-                st.session_state.checkins.insert(
-                    0, {"date": date.today().isoformat(), "checkin": checkin, "result": result}
-                )
-                show_result(result)
-            else:
+            if not is_complete(core):
                 st.warning("請先完成四項必填欄位（＊）。")
+            else:
+                weight = float(weight_now) or None
+                errors = validate_profile(weight, None)
+                if errors:
+                    for err in errors:
+                        st.error(err)
+                else:
+                    base = st.session_state.visit_data
+                    checkin = to_checkin(
+                        core,
+                        missed=int(missed),
+                        weight=weight,
+                        previous_weight=latest_weight(),
+                        species=base.species if base else "貓",
+                        age=base.age_years if base else None,
+                    )
+                    result = triage_checkin(checkin)
+                    st.session_state.checkins.insert(
+                        0,
+                        {"date": date.today().isoformat(), "checkin": checkin, "result": result},
+                    )
+                    show_result(result)
         if st.session_state.checkins:
             st.markdown("#### 打卡紀錄")
             rows = [
                 {
                     "日期": e["date"],
                     "燈號": LEVEL_LABEL[e["result"].level],
+                    "體重（公斤）": f"{e['checkin'].weight_kg:.1f}" if e["checkin"].weight_kg else "未量測",
                     "摘要": "；".join(e["result"].reasons) or "無異常",
                 }
                 for e in st.session_state.checkins
@@ -238,6 +325,9 @@ else:
             st.info("飼主尚未提交診前紀錄。")
         else:
             items = [
+                ("物種", visit.species),
+                ("年齡", f"{visit.age_years:g} 歲" if visit.age_years is not None else "未填"),
+                ("體重", f"{visit.weight_kg:g} 公斤" if visit.weight_kg else "未填"),
                 ("食慾", visit.appetite),
                 ("飲水", visit.water),
                 ("排便", visit.stool),
@@ -248,14 +338,26 @@ else:
                 pd.DataFrame([{"項目": a, "飼主回報": b} for a, b in items]), hide_index=True
             )
             show_result(triage_checkin(visit))
+            weights = [
+                {"日期": e["date"], "體重（公斤）": e["checkin"].weight_kg}
+                for e in st.session_state.checkins
+                if e["checkin"].weight_kg
+            ]
+            if weights:
+                st.markdown("#### 打卡體重紀錄")
+                st.dataframe(pd.DataFrame(weights), hide_index=True)
             st.caption("摘要為規則式整理，最終判斷請由獸醫師決定。")
 
     with tab_draft:
         st.subheader("病歷草稿（需獸醫確認）")
         if visit is None:
             st.info("需先有飼主的診前紀錄，才能產生 SOAP 草稿。")
-        st.text_area("獸醫檢查紀錄（O 的來源）", key="vet_input", height=120,
-                     placeholder="例：體重、觸診、檢查結果…")
+        st.text_area(
+            "獸醫檢查紀錄（O 的來源）",
+            key="vet_input",
+            height=120,
+            placeholder="例：觸診、檢查結果、獸醫量測的體重…",
+        )
         st.button("產生 SOAP 草稿", on_click=generate_soap, key="soap_generate")
         st.text_area("S 主觀資料", key="soap_S", height=100)
         st.text_area("O 客觀資料", key="soap_O", height=100)
@@ -292,6 +394,7 @@ with st.expander("資料與安全說明（Prototype）"):
     st.markdown(
         """
 - 所有病患、飼主與病歷資料皆為**虛構示範**，請勿輸入真實個人或寵物資料。
+- 年齡與體重是獸醫評估的基本資料，本版**僅用於照護提醒與摘要**，不做任何劑量計算。
 - 資料只保存在本次瀏覽器工作階段，重新整理即清空，不會上傳或寫入資料庫。
 - 本版不上傳寵物影像、聲音或定位資料。
 - 角色切換僅供 Demo 展示，正式版將以登入與權限控管取代。

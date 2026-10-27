@@ -6,6 +6,8 @@
     build_soap_draft,
     owner_care_plan,
     triage_checkin,
+    validate_profile,
+    weight_change_note,
 )
 
 
@@ -57,3 +59,31 @@ def test_red_plan_starts_with_urgent_action():
 def test_plan_never_changes_diet_without_vet():
     steps = owner_care_plan(CheckIn(), triage_checkin(CheckIn()))
     assert any("諮詢獸醫" in s for s in steps)
+
+
+def test_weight_drop_over_threshold_is_yellow():
+    c = CheckIn(weight_kg=4.0, previous_weight_kg=4.5)
+    assert triage_checkin(c).level == YELLOW
+
+
+def test_small_weight_change_is_ignored():
+    c = CheckIn(weight_kg=4.3, previous_weight_kg=4.5)
+    assert triage_checkin(c).level == GREEN
+
+
+def test_missing_weight_gives_no_note():
+    assert weight_change_note(None, 4.5) is None
+    assert weight_change_note(4.0, None) is None
+
+
+def test_profile_validation_rejects_out_of_range():
+    assert validate_profile(weight_kg=500.0, age_years=3) != []
+    assert validate_profile(weight_kg=4.2, age_years=-1) != []
+    assert validate_profile(weight_kg=4.2, age_years=3) == []
+
+
+def test_soap_subjective_includes_profile():
+    c = CheckIn(species="貓", age_years=3, weight_kg=4.2)
+    draft = build_soap_draft(c, triage_checkin(c), "")
+    assert "4.2 公斤" in draft["S"]
+    assert "3 歲" in draft["S"]
