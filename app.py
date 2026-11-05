@@ -1,4 +1,4 @@
-"""毛孩照護閉環 Prototype（2026 法國皇家 AI for Pets 決賽版）
+"""毛孩智慧照護（2026 法國皇家 AI for Pets 決賽版）
 
 - 所有病患、飼主與病歷資料皆為虛構示範資料。
 - 資料只存在本次瀏覽器工作階段，不上傳、不寫入資料庫。
@@ -46,7 +46,7 @@ DISCLAIMER = (
 DEMO_PATIENT = {"id": "DEMO-001", "name": "小橘（虛構示範）"}
 LEVEL_LABEL = {RED: "🔴 紅燈", YELLOW: "🟡 黃燈", GREEN: "🟢 綠燈"}
 
-st.set_page_config(page_title="毛孩照護閉環 Prototype", page_icon="🐾", layout="wide")
+st.set_page_config(page_title="毛孩智慧照護", page_icon="🐾", layout="wide")
 
 
 # ---------- 狀態管理 ----------
@@ -252,7 +252,7 @@ st.sidebar.metric("照護計畫已發布", "是" if st.session_state.published_p
 st.sidebar.button("重置 Demo 資料", on_click=reset_demo)
 
 # 主畫面
-st.title("🐾 毛孩照護閉環 Prototype")
+st.title("🐾 毛孩智慧照護")
 st.caption("2026 法國皇家 AI for Pets｜決賽 Prototype｜所有資料皆為虛構示範")
 st.warning(DISCLAIMER)
 
