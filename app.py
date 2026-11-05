@@ -1,4 +1,4 @@
-﻿"""毛孩照護閉環 Prototype（2026 法國皇家 AI for Pets 決賽版）
+"""毛孩照護閉環 Prototype（2026 法國皇家 AI for Pets 決賽版）
 
 - 所有病患、飼主與病歷資料皆為虛構示範資料。
 - 資料只存在本次瀏覽器工作階段，不上傳、不寫入資料庫。
@@ -29,6 +29,13 @@ from triage import (
     validate_profile,
 )
 
+from ai_panel import (
+    owner_note,
+    render_owner_text_ai,
+    render_photo_ai,
+    render_vet_ai_summary,
+)
+
 PLACEHOLDER = "請選擇"
 CORE_KEYS = ["appetite", "water", "stool", "energy"]
 DRAFT_PLACEHOLDER = "（待獸醫填寫）"
@@ -49,10 +56,26 @@ def init_state() -> None:
         if key not in st.session_state:
             st.session_state[key] = value
 
+    # 舊版照片沒有綁定具體的提交紀錄。
+    # 保留並標示來源，但不猜測屬於哪一次提交。
+    if not st.session_state.get("_record_split_migrated", False):
+        st.session_state["_legacy_pre_photos"] = list(
+            st.session_state.get("pre_photo_notes", [])
+        )
+        st.session_state["_legacy_ci_photos"] = list(
+            st.session_state.get("ci_photo_notes", [])
+        )
+        st.session_state["pre_photo_notes"] = []
+        st.session_state["ci_photo_notes"] = []
+        st.session_state["_record_split_migrated"] = True
+
 
 def reset_demo() -> None:
     for key in list(st.session_state.keys()):
-        if key.startswith(("pre_", "ci_", "soap_")) or key == "vet_input":
+        if (
+            key.startswith(("pre_", "ci_", "soap_", "_legacy_"))
+            or key in ("vet_input", "_record_split_migrated")
+        ):
             del st.session_state[key]
     st.session_state.visit_data = None
     st.session_state.checkins = []
@@ -63,8 +86,34 @@ def generate_soap() -> None:
     visit = st.session_state.visit_data
     if visit is None:
         return
+
     result = triage_checkin(visit)
-    draft = build_soap_draft(visit, result, st.session_state.get("vet_input", ""))
+    vet_exam = st.session_state.get("vet_input", "")
+    draft = build_soap_draft(visit, result, vet_exam)
+
+    note = owner_note()
+    if note:
+        draft["S"] += f" 飼主補充描述（AI 整理，需獸醫確認）：{note}"
+
+    # 保留規則式分級，AI 只新增供獸醫確認的草稿。
+    try:
+        from cf_vision import generate_vet_assessment
+
+        ai_assessment = generate_vet_assessment(
+            subjective=draft["S"],
+            objective=vet_exam,
+            rule_assessment=draft["A"],
+        )
+        draft["A"] += (
+            "\\n\\n【AI 初步鑑別草稿，非診斷，需獸醫確認】\\n"
+            + ai_assessment
+        )
+    except Exception:
+        draft["A"] += (
+            "\\n\\n【AI 初步鑑別草稿】暫時無法產生，"
+            "請由獸醫自行評估；以上規則式分級仍供參考。"
+        )
+
     st.session_state["soap_S"] = draft["S"]
     st.session_state["soap_O"] = draft["O"]
     st.session_state["soap_A"] = draft["A"]
@@ -219,6 +268,8 @@ if role == "飼主":
         profile = collect_profile()
         st.markdown("#### 居家觀察")
         core = collect_core("pre")
+        render_owner_text_ai("pre")
+        render_photo_ai("pre")
         if st.button("儲存診前紀錄", type="primary", key="pre_save"):
             errors = validate_profile(profile["weight"], profile["age"])
             if not (profile["age"] and profile["weight"]):
@@ -235,6 +286,20 @@ if role == "飼主":
                     species=profile["species"],
                     age=profile["age"],
                 )
+                pending_photos = list(
+                    st.session_state.get("pre_photo_notes", [])
+                )
+                saved_photos = list(
+                    st.session_state.get("pre_saved_photo_notes", [])
+                )
+                st.session_state["pre_saved_photo_notes"] = (
+                    pending_photos + saved_photos
+                )
+                st.session_state["pre_photo_notes"] = []
+                st.session_state["pre_saved_ai_result"] = (
+                    st.session_state.get("pre_ai_result")
+                )
+                st.session_state["pre_saved_date"] = date.today().isoformat()
                 st.success("已儲存，獸醫可於「診前摘要」查看。")
         if st.session_state.visit_data is not None:
             st.markdown("#### 系統初步提醒")
@@ -242,7 +307,7 @@ if role == "飼主":
 
     with tab_checkin:
         st.subheader("每日照護打卡")
-        st.caption("記錄飼主的人工觀察與體重（選填），本版不使用影像、聲音或定位資料。")
+        st.caption("記錄飼主的人工觀察與體重（選填）。本版不記錄聲音或定位資料；影像判讀請使用下方 AI 區塊。")
         core = collect_core("ci")
         weight_now = st.number_input(
             "今日體重（公斤，選填，0 表示未量測）",
@@ -256,6 +321,7 @@ if role == "飼主":
         missed = st.number_input(
             "今日漏服用藥次數", min_value=0, max_value=10, value=0, key="ci_missed"
         )
+        render_photo_ai("ci")
         if st.button("送出今日打卡", type="primary", key="ci_submit"):
             if not is_complete(core):
                 st.warning("請先完成四項必填欄位（＊）。")
@@ -276,10 +342,19 @@ if role == "飼主":
                         age=base.age_years if base else None,
                     )
                     result = triage_checkin(checkin)
+                    pending_photos = list(
+                        st.session_state.get("ci_photo_notes", [])
+                    )
                     st.session_state.checkins.insert(
                         0,
-                        {"date": date.today().isoformat(), "checkin": checkin, "result": result},
+                        {
+                            "date": date.today().isoformat(),
+                            "checkin": checkin,
+                            "result": result,
+                            "photos": pending_photos,
+                        },
                     )
+                    st.session_state["ci_photo_notes"] = []
                     show_result(result)
         if st.session_state.checkins:
             st.markdown("#### 打卡紀錄")
@@ -320,33 +395,117 @@ else:
     tab_summary, tab_draft, tab_alert = st.tabs(["① 診前摘要", "② 病歷草稿", "③ 異常警示"])
 
     with tab_summary:
-        st.subheader("診前摘要")
+        from ai_panel import _show_photo_result
+
+        st.subheader("① 診前紀錄")
         if visit is None:
             st.info("飼主尚未提交診前紀錄。")
         else:
+            saved_date = st.session_state.get("pre_saved_date")
+            if saved_date:
+                st.caption(f"診前紀錄儲存日期：{saved_date}")
+            else:
+                st.caption("舊版診前紀錄：儲存日期未記錄。")
+
             items = [
                 ("物種", visit.species),
-                ("年齡", f"{visit.age_years:g} 歲" if visit.age_years is not None else "未填"),
-                ("體重", f"{visit.weight_kg:g} 公斤" if visit.weight_kg else "未填"),
+                (
+                    "年齡",
+                    f"{visit.age_years:g} 歲"
+                    if visit.age_years is not None else "未填",
+                ),
+                (
+                    "體重",
+                    f"{visit.weight_kg:g} 公斤"
+                    if visit.weight_kg is not None else "未填",
+                ),
                 ("食慾", visit.appetite),
                 ("飲水", visit.water),
                 ("排便", visit.stool),
                 ("精神狀態", visit.energy),
-                ("其他症狀", "、".join(visit.symptoms) or "無"),
+                ("其他症狀", "、".join(visit.symptoms) or "未填"),
             ]
             st.dataframe(
-                pd.DataFrame([{"項目": a, "飼主回報": b} for a, b in items]), hide_index=True
+                pd.DataFrame(items, columns=["項目", "飼主回報"]),
+                hide_index=True,
             )
             show_result(triage_checkin(visit))
-            weights = [
-                {"日期": e["date"], "體重（公斤）": e["checkin"].weight_kg}
-                for e in st.session_state.checkins
-                if e["checkin"].weight_kg
-            ]
-            if weights:
-                st.markdown("#### 打卡體重紀錄")
-                st.dataframe(pd.DataFrame(weights), hide_index=True)
-            st.caption("摘要為規則式整理，最終判斷請由獸醫師決定。")
+            render_vet_ai_summary()
+
+        st.divider()
+        st.subheader("② 每日打卡紀錄")
+        st.caption(
+            "每次送出打卡都是獨立紀錄；影像只顯示該次送出時綁定的內容。"
+        )
+
+        checkins = st.session_state.checkins
+        if not checkins:
+            st.info("目前沒有每日打卡紀錄。")
+
+        for index, entry in enumerate(checkins):
+            c = entry["checkin"]
+            result = entry["result"]
+            label = (
+                f"{entry['date']}｜{LEVEL_LABEL.get(result.level, result.level)}"
+                f"｜第 {len(checkins) - index} 筆打卡"
+            )
+
+            with st.expander(label, expanded=(index == 0)):
+                checkin_items = [
+                    (
+                        "體重",
+                        f"{c.weight_kg:g} 公斤"
+                        if c.weight_kg is not None else "未量測",
+                    ),
+                    ("食慾", c.appetite),
+                    ("飲水", c.water),
+                    ("排便", c.stool),
+                    ("精神狀態", c.energy),
+                    ("其他症狀", "、".join(c.symptoms) or "未填"),
+                    ("漏服用藥次數", str(c.missed_doses)),
+                ]
+                st.dataframe(
+                    pd.DataFrame(checkin_items, columns=["項目", "飼主回報"]),
+                    hide_index=True,
+                )
+                show_result(result)
+
+                st.markdown("#### 此次打卡｜照片與影片")
+                if "photos" not in entry:
+                    st.caption(
+                        "這是舊版打卡紀錄，當時未建立影像綁定，"
+                        "無法確認哪些影像屬於本次打卡。"
+                    )
+                elif not entry["photos"]:
+                    st.caption("此次打卡沒有已綁定的影像。")
+                else:
+                    for photo in entry["photos"]:
+                        _show_photo_result(photo)
+
+        legacy_pre = st.session_state.get("_legacy_pre_photos", [])
+        legacy_ci = st.session_state.get("_legacy_ci_photos", [])
+
+        if legacy_pre or legacy_ci:
+            st.divider()
+            st.subheader("③ 舊版影像｜未綁定提交紀錄")
+            st.caption(
+                "以下影像由舊版保存，可辨識入口，但無法確認屬於"
+                "哪一次提交；請勿自動當成某筆紀錄的影像。"
+            )
+
+            if legacy_pre:
+                st.markdown("#### 從診前入口上傳的舊影像")
+                for photo in legacy_pre:
+                    _show_photo_result(photo)
+
+            if legacy_ci:
+                st.markdown("#### 從打卡入口上傳的舊影像")
+                for photo in legacy_ci:
+                    _show_photo_result(photo)
+
+        st.caption(
+            "AI 影像與文字內容僅供參考，最終判斷請由獸醫師決定。"
+        )
 
     with tab_draft:
         st.subheader("病歷草稿（需獸醫確認）")
@@ -396,7 +555,7 @@ with st.expander("資料與安全說明（Prototype）"):
 - 所有病患、飼主與病歷資料皆為**虛構示範**，請勿輸入真實個人或寵物資料。
 - 年齡與體重是獸醫評估的基本資料，本版**僅用於照護提醒與摘要**，不做任何劑量計算。
 - 資料只保存在本次瀏覽器工作階段，重新整理即清空，不會上傳或寫入資料庫。
-- 本版不上傳寵物影像、聲音或定位資料。
+- 影像判讀時，照片或影片會傳送至所設定的 AI 服務處理，處理後即刪除，不寫入系統資料庫；本版不記錄聲音或定位資料。
 - 角色切換僅供 Demo 展示，正式版將以登入與權限控管取代。
 - 所有分級結果為照護提醒，不構成診斷或治療指示。
 """

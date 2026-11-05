@@ -1,2 +1,7 @@
 ﻿streamlit>=1.40
 pandas>=2.0
+
+openai>=1.40
+
+opencv-python-headless>=4.8
+python-dotenv>=1.0
